@@ -24,7 +24,7 @@ go run .
 ```
 You will see log output confirming the load balancer and the health checker have started.
 
-2. Simulate Backend Services
+### 2. Simulate Backend Services
 Open three separate terminal windows and run one command in each to act as your backend servers:
 
 ```bash
@@ -38,7 +38,7 @@ ncat -lk 9002
 ncat -lk 9003
 ```
 
-3. Connect a Client
+### 3. Connect a Client
 Use a TCP client like PuTTY.
 
 ```putty
