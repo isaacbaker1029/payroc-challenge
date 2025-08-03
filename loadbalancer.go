@@ -12,20 +12,20 @@ import (
 // LoadBalancer holds the state for our load balancer
 // sync Mutex is used similar to 'synchronized' in java, makes parts of the application single threaded to avoid contentions
 type LoadBalancer struct {
-	listenerPort    string
-	allBackends     []string
-	healthyBackends []string
-	mu              sync.RWMutex // RWMutex is now used for better read performance
-	nextBackend     int
+	listenerPort       string
+	allBackends        []string
+	healthyBackends    []string
+	mu                 sync.RWMutex // RWMutex is now used for better read performance
+	backendConnections map[string]int
 }
 
 // NewLoadBalancer creates a new LoadBalancer instance
 func NewLoadBalancer(port string, backends []string) *LoadBalancer {
 	return &LoadBalancer{
-		listenerPort:    port,
-		allBackends:     backends,
-		healthyBackends: make([]string, 0), // Start with no healthy backends until watchdog runs
-		nextBackend:     0,
+		listenerPort:       port,
+		allBackends:        backends,
+		healthyBackends:    make([]string, 0), // Start with no healthy backends until watchdog runs
+		backendConnections: make(map[string]int),
 	}
 }
 
@@ -38,9 +38,17 @@ func (lb *LoadBalancer) getNextBackend() (string, error) {
 		return "", fmt.Errorf("no healthy backends available")
 	}
 
-	backend := lb.healthyBackends[lb.nextBackend]
-	lb.nextBackend = (lb.nextBackend + 1) % len(lb.healthyBackends)
-	return backend, nil
+	// Find the backend with the minimum number of connections
+	minConnections := -1
+	var bestBackend string
+	for _, backendAddr := range lb.healthyBackends {
+		count := lb.backendConnections[backendAddr]
+		if minConnections == -1 || count < minConnections {
+			minConnections = count
+			bestBackend = backendAddr
+		}
+	}
+	return bestBackend, nil
 }
 
 // handleConnection manages an incoming client connection
@@ -53,7 +61,19 @@ func (lb *LoadBalancer) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	log.Printf("Forwarding connection from %s to %s", clientConn.RemoteAddr(), backendAddr)
+	// Increment connection count for the chosen backend
+	lb.mu.Lock()
+	lb.backendConnections[backendAddr]++
+	lb.mu.Unlock()
+
+	// Decrement the connection count when the handler exits
+	defer func() {
+		lb.mu.Lock()
+		lb.backendConnections[backendAddr]--
+		lb.mu.Unlock()
+	}()
+
+	log.Printf("Forwarding connection from %s to %s (current connections: %d)", clientConn.RemoteAddr(), backendAddr, lb.backendConnections[backendAddr])
 
 	backendConn, err := net.Dial("tcp", backendAddr)
 	if err != nil {
@@ -70,11 +90,20 @@ func (lb *LoadBalancer) handleConnection(clientConn net.Conn) {
 func (lb *LoadBalancer) updateHealthyBackends(newHealthyBackends []string) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
-	lb.healthyBackends = newHealthyBackends
-	// Reset index if it's out of bounds after the update
-	if lb.nextBackend >= len(lb.healthyBackends) {
-		lb.nextBackend = 0
+
+	// Prune the connection counts for any backends that are no longer healthy
+	currentCounts := make(map[string]int)
+	for _, backendAddr := range newHealthyBackends {
+		// Carry over the count if the backend was already known
+		if count, ok := lb.backendConnections[backendAddr]; ok {
+			currentCounts[backendAddr] = count
+		} else {
+			currentCounts[backendAddr] = 0
+		}
 	}
+
+	lb.healthyBackends = newHealthyBackends
+	lb.backendConnections = currentCounts
 }
 
 // Start begins the load balancer's listening loop
