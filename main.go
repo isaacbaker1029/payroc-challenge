@@ -1,6 +1,7 @@
 // main
 package main
 
+// Main helper method
 func main() {
 	backendServers := []string{
 		"localhost:9001",
