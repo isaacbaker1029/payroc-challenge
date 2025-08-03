@@ -12,53 +12,34 @@ import (
 // LoadBalancer holds the state for our load balancer
 // sync Mutex is used similar to 'synchronized' in java, makes parts of the application single threaded to avoid contentions
 type LoadBalancer struct {
-	listenerPort string
-	backends     []string
-	mu           sync.Mutex
-	nextBackend  int
+	listenerPort    string
+	allBackends     []string
+	healthyBackends []string
+	mu              sync.RWMutex // RWMutex is now used for better read performance
+	nextBackend     int
 }
 
 // NewLoadBalancer creates a new LoadBalancer instance
 func NewLoadBalancer(port string, backends []string) *LoadBalancer {
 	return &LoadBalancer{
-		listenerPort: port,
-		backends:     backends,
-		nextBackend:  0,
+		listenerPort:    port,
+		allBackends:     backends,
+		healthyBackends: make([]string, 0), // Start with no healthy backends until watchdog runs
+		nextBackend:     0,
 	}
 }
 
-// removeBackend safely removes a backend from the pool
-func (lb *LoadBalancer) removeBackend(addr string) {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
-
-	var updatedBackends []string
-	for _, backendAddr := range lb.backends {
-		if backendAddr != addr {
-			updatedBackends = append(updatedBackends, backendAddr)
-		}
-	}
-
-	if len(updatedBackends) < len(lb.backends) {
-		lb.backends = updatedBackends
-		log.Printf("Removed backend %s from the pool. %d backends remaining.", addr, len(lb.backends))
-		if lb.nextBackend >= len(lb.backends) {
-			lb.nextBackend = 0
-		}
-	}
-}
-
-// getNextBackend selects the next available backend using round-robin
+// getNextBackend selects the next healthy backend using round-robin
 func (lb *LoadBalancer) getNextBackend() (string, error) {
-	lb.mu.Lock()
-	defer lb.mu.Unlock()
+	lb.mu.RLock() // Use a read-lock, allowing multiple connections at once
+	defer lb.mu.RUnlock()
 
-	if len(lb.backends) == 0 {
-		return "", fmt.Errorf("no available backends")
+	if len(lb.healthyBackends) == 0 {
+		return "", fmt.Errorf("no healthy backends available")
 	}
 
-	backend := lb.backends[lb.nextBackend]
-	lb.nextBackend = (lb.nextBackend + 1) % len(lb.backends)
+	backend := lb.healthyBackends[lb.nextBackend]
+	lb.nextBackend = (lb.nextBackend + 1) % len(lb.healthyBackends)
 	return backend, nil
 }
 
@@ -76,14 +57,24 @@ func (lb *LoadBalancer) handleConnection(clientConn net.Conn) {
 
 	backendConn, err := net.Dial("tcp", backendAddr)
 	if err != nil {
-		log.Printf("Failed to connect to backend %s: %v", backendAddr, err)
-		lb.removeBackend(backendAddr)
+		log.Printf("Failed to connect to healthy backend %s: %v", backendAddr, err)
 		return
 	}
 	defer backendConn.Close()
 
 	go io.Copy(backendConn, clientConn)
 	io.Copy(clientConn, backendConn)
+}
+
+// updateHealthyBackends is called by the watchdog to update the list of healthy servers.
+func (lb *LoadBalancer) updateHealthyBackends(newHealthyBackends []string) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	lb.healthyBackends = newHealthyBackends
+	// Reset index if it's out of bounds after the update
+	if lb.nextBackend >= len(lb.healthyBackends) {
+		lb.nextBackend = 0
+	}
 }
 
 // Start begins the load balancer's listening loop
